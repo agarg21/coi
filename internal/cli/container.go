@@ -6,7 +6,9 @@ import (
 	"os"
 	"strings"
 
+	"github.com/coipond/coi/internal/config"
 	"github.com/coipond/coi/internal/container"
+	"github.com/coipond/coi/internal/logger"
 	"github.com/coipond/coi/internal/network"
 	"github.com/coipond/coi/internal/session"
 	"github.com/spf13/cobra"
@@ -28,6 +30,11 @@ var containerLaunchCmd = &cobra.Command{
 		image := args[0]
 		name := args[1]
 
+		// The [defaults] profile, as `coi shell` applies it: it can set the
+		// network mode isolation uses below, and the Incus project, so it must
+		// be in effect before the container is touched.
+		app.applyDefaultProfileForOps(cmd)
+
 		ephemeral, _ := cmd.Flags().GetBool("ephemeral")
 		pool, _ := cmd.Flags().GetString("storage")
 
@@ -46,6 +53,13 @@ var containerLaunchCmd = &cobra.Command{
 			return fmt.Errorf("failed to launch container: %v", err)
 		}
 
+		// Launch starts the container, so it gets the same isolation as a start
+		// (see isolateStartedContainer); without it the container ran with no
+		// firewall at all, whatever network.mode said.
+		if err := app.isolateStartedContainer(cmd, name); err != nil {
+			return stopUnisolated(name, err)
+		}
+
 		fmt.Fprintf(os.Stderr, "Container %s launched from %s\n", name, image)
 		return nil
 	},
@@ -58,6 +72,9 @@ var containerStartCmd = &cobra.Command{
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		name := args[0]
+
+		// See containerLaunchCmd: the [defaults] profile before anything else.
+		app.applyDefaultProfileForOps(cmd)
 
 		// #691: proactively apply the #683 shift→raw.idmap decision before
 		// starting, deriving the statfs-sweep sources from the container's own
@@ -82,9 +99,71 @@ var containerStartCmd = &cobra.Command{
 			return fmt.Errorf("failed to start container: %v", err)
 		}
 
+		// A stop removes the container's firewall rules (they are keyed by an IP
+		// and a veth that the next start replaces), so a bare start must put them
+		// back, as `coi shell` and `coi run` do. Fail closed: a coi container that
+		// cannot be isolated is stopped rather than left running unfiltered.
+		if err := app.isolateStartedContainer(cmd, name); err != nil {
+			return stopUnisolated(name, err)
+		}
+
 		fmt.Fprintf(os.Stderr, "Container %s started\n", name)
 		return nil
 	},
+}
+
+// isolateStartedContainer applies the configured network isolation to a coi
+// container that `coi container start` or `coi container launch` just started,
+// the way `coi shell` does: the [defaults] profile's network config, a boot
+// block first (non-open modes), a wait until the guest is ready (setup execs
+// into it), then SetupForContainer for every mode, which also lifts the boot
+// block and, in open mode, re-adds the accept rule a stop removed.
+// Containers outside coi's naming scheme are left alone: these commands can
+// start any Incus container, and firewalling someone else's would be a surprise.
+func (a *App) isolateStartedContainer(cmd *cobra.Command, name string) error {
+	if a.cfg == nil || !isCoiContainerName(name) {
+		return nil
+	}
+	ctx := cmd.Context()
+	a.applyDefaultProfileForOps(cmd) // no-op if the caller already applied it
+	netCfg := a.cfg.Network
+	if m := netCfg.Mode; m != "" && m != config.NetworkModeOpen {
+		if err := network.ApplyBootBlockRule(name); err != nil {
+			return fmt.Errorf("boot network block failed in %s mode: %w", m, err)
+		}
+		if changed, bridgeName, err := network.EnsureBridgeInTrustedZone(); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: could not ensure bridge forwarding rules: %v\n", err)
+		} else if changed {
+			fmt.Fprintf(os.Stderr, "Added iptables FORWARD rules for %s\n", bridgeName)
+		}
+	}
+	if err := session.WaitForReady(ctx, container.NewManager(name), 30, func(string) {}); err != nil {
+		return err
+	}
+	nm := network.NewManager(&netCfg, logger.NewDiscard())
+	if err := nm.SetupForContainer(ctx, name); err != nil {
+		return fmt.Errorf("failed to setup network isolation: %w", err)
+	}
+	fmt.Fprintf(os.Stderr, "Network isolation applied: %s\n", netCfg.Mode)
+	return nil
+}
+
+// isCoiContainerName reports whether name follows coi's container naming.
+func isCoiContainerName(name string) bool {
+	return strings.HasPrefix(name, session.GetContainerPrefix())
+}
+
+// stopUnisolated stops a container whose network isolation could not be
+// applied, so it never keeps running unfiltered, removes whatever part of the
+// isolation did get installed (it is keyed by an IP the stopped container no
+// longer reports), and returns the error to report.
+func stopUnisolated(name string, isolateErr error) error {
+	containerIP, _ := network.GetContainerIPFast(name)
+	if stopErr := container.NewManager(name).Stop(true); stopErr != nil {
+		return fmt.Errorf("failed to apply network isolation (%v), and failed to stop the container: %v", isolateErr, stopErr)
+	}
+	cleanupContainerFirewall(name, containerIP)
+	return fmt.Errorf("failed to apply network isolation, container stopped: %v", isolateErr)
 }
 
 // containerStopCmd stops a running container
@@ -97,8 +176,27 @@ var containerStopCmd = &cobra.Command{
 		force, _ := cmd.Flags().GetBool("force")
 
 		mgr := container.NewManager(name)
+
+		// Read the IP while the container still has one: its firewall rules are keyed by it, and
+		// a stopped container reports none, so a later `coi container delete` (or anything else)
+		// could no longer find them. They leaked on every stop of a background session
+		// (`coi shell --background` never runs the session teardown). Removing them here is
+		// safe: `coi shell`, `coi run` and `coi container start` all re-apply the rules for the
+		// IP the container gets on its next start.
+		// Only coi containers carry coi rules; skip the IP lookup (up to 3s
+		// without a lease) for anything else.
+		coiContainer := isCoiContainerName(name)
+		var containerIP string
+		if coiContainer && network.NftAvailable() {
+			containerIP, _ = network.GetContainerIPFast(name)
+		}
+
 		if err := mgr.Stop(force); err != nil {
 			return fmt.Errorf("failed to stop container: %v", err)
+		}
+
+		if coiContainer {
+			cleanupContainerFirewall(name, containerIP)
 		}
 
 		fmt.Fprintf(os.Stderr, "Container %s stopped\n", name)
