@@ -1,6 +1,7 @@
 package audit
 
 import (
+	"bufio"
 	"context"
 	_ "embed"
 	"encoding/json"
@@ -8,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 //go:embed agent/agent.sh
@@ -83,27 +85,99 @@ func HostAuditTail(path string, follow bool, sessionID, container string, out io
 	}
 	defer f.Close()
 
-	enc := json.NewEncoder(out)
-	enc.SetEscapeHTML(false)
-
-	read := func() error {
-		return StreamEvents(f, sessionID, container, func(ev Event) error {
-			// Snapshot/threat objects from the host-side audit log don't
-			// match our event shape; preserve them as raw audit msg blobs.
-			if ev.Type == "" {
-				ev.Type = TypeAudit
-			}
-			return enc.Encode(ev)
-		}, nil)
-	}
-
-	if err := read(); err != nil {
+	c := newHostAuditCopier(f, sessionID, container, out)
+	if err := c.drain(); err != nil {
 		return err
 	}
 	if !follow {
-		return nil
+		// A dump prints a final record even when it has no trailing newline.
+		return c.flush()
 	}
 	// Tail mode: simple sleep-poll loop over the same fd. We don't pull
-	// in a heavy fsnotify dep just for this.
-	return tailFollow(f, sessionID, container, out)
+	// in a heavy fsnotify dep just for this. A trailing partial line stays
+	// pending in c until the writer finishes it.
+	return tailFollow(c)
+}
+
+// copyHostAuditLines writes each record of a host-side audit log to out. Lines
+// in the agent's event schema (a recording made with --follow) are re-encoded
+// with sessionID/container stamped on, as StreamEvents does. The monitor's own
+// records (threat events and snapshots, written by internal/monitor.AuditLog)
+// carry no `type` and would be rejected by ParseLine, so a JSON object that is
+// not an agent event is passed through verbatim. Anything else is skipped.
+func copyHostAuditLines(r io.Reader, sessionID, container string, out io.Writer) error {
+	c := newHostAuditCopier(r, sessionID, container, out)
+	if err := c.drain(); err != nil {
+		return err
+	}
+	return c.flush()
+}
+
+// hostAuditCopier is the incremental form of copyHostAuditLines used by the
+// dump and --follow paths. It reads with bufio.Reader rather than
+// bufio.Scanner so that (a) a record has no length cap (a monitor snapshot
+// lists every process's full command line and can exceed any fixed token
+// limit, which would abort the whole dump), and (b) a record the monitor is
+// still writing when we hit EOF is held in pending instead of being split
+// into two invalid halves and dropped.
+type hostAuditCopier struct {
+	br        *bufio.Reader
+	pending   []byte
+	enc       *json.Encoder
+	out       io.Writer
+	sessionID string
+	container string
+}
+
+func newHostAuditCopier(r io.Reader, sessionID, container string, out io.Writer) *hostAuditCopier {
+	enc := json.NewEncoder(out)
+	enc.SetEscapeHTML(false)
+	return &hostAuditCopier{br: bufio.NewReader(r), enc: enc, out: out, sessionID: sessionID, container: container}
+}
+
+// drain emits every complete (newline-terminated) line available now. A
+// trailing partial line is kept in pending for the next drain or flush.
+func (c *hostAuditCopier) drain() error {
+	for {
+		chunk, err := c.br.ReadBytes('\n')
+		c.pending = append(c.pending, chunk...)
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		line := c.pending
+		c.pending = nil
+		if err := c.emit(line); err != nil {
+			return err
+		}
+	}
+}
+
+// flush emits a pending final line that has no trailing newline.
+func (c *hostAuditCopier) flush() error {
+	line := c.pending
+	c.pending = nil
+	return c.emit(line)
+}
+
+func (c *hostAuditCopier) emit(raw []byte) error {
+	line := strings.TrimSpace(string(raw))
+	// ParseLine turns non-JSON lines into agent.stderr audit events, as the
+	// dump did before monitor records were passed through.
+	if ev, err := ParseLine(line); err == nil && ev != nil {
+		if c.sessionID != "" {
+			ev.SessionID = c.sessionID
+		}
+		if c.container != "" {
+			ev.Container = c.container
+		}
+		return c.enc.Encode(ev)
+	}
+	if json.Valid([]byte(line)) {
+		_, err := io.WriteString(c.out, line+"\n")
+		return err
+	}
+	return nil
 }
