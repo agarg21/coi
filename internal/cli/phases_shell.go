@@ -578,13 +578,50 @@ func (a *App) runToolPhase(s *shellState) session.Phase {
 	return session.PhaseFunc{
 		PhaseName: "run-tool",
 		RunFn: func(_ context.Context) (session.Teardown, error) {
+			// Resolve the env once, before the report: env_commands run here, so
+			// the report names what was actually minted, and the tool gets the
+			// same env.
+			containerEnv, userPtr, envSources, err := a.buildContainerEnv(s.result)
+			if err != nil {
+				return nil, err
+			}
+			useResumeFlag := (s.resumeID != "") && a.persistent
+			restoreOnly := (s.resumeID != "") && !a.persistent
+
+			// In tmux mode the session is prepared first: an existing one is
+			// found (the tool in it keeps its env), or a new one is created,
+			// starting the tool. So the report says exactly what this launch
+			// did, before anything is visible, and a failed pre-launch step
+			// fails the launch before a report claims a start. The report goes
+			// before the "Starting session..." block so that block stays right
+			// above the tool's output.
+			launch := session.ToolStarted
+			var tl *tmuxLaunch
+			var dl *directLaunch
+			if !s.useTmux {
+				// Direct mode: the pre-launch steps run now too, so their
+				// failure stops the launch before the report claims a start.
+				if dl, err = a.prepareDirect(s.result, containerEnv, userPtr, s.sessionID, useResumeFlag, restoreOnly, s.sessionsDir, s.resumeID, s.toolInstance); err != nil {
+					return nil, err
+				}
+			} else {
+				if tl, err = a.prepareTmux(s.result, containerEnv, userPtr, s.sessionID, useResumeFlag, restoreOnly, s.sessionsDir, s.resumeID, s.toolInstance); err != nil {
+					return nil, err
+				}
+				if tl.existing {
+					launch = session.ToolAttached
+					if background {
+						launch = session.ToolSentToPane
+					}
+				}
+			}
+			if g := s.result.Grants; g != nil {
+				fmt.Fprintf(os.Stderr, "\n%s", g.WithEnv(envSources, launch).Render())
+			}
 			fmt.Fprintf(os.Stderr, "\nStarting session...\n")
 			fmt.Fprintf(os.Stderr, "Session ID: %s\n", s.sessionID)
 			fmt.Fprintf(os.Stderr, "Container: %s\n", s.result.ContainerName)
 			fmt.Fprintf(os.Stderr, "Workspace: %s\n", s.absWorkspace)
-
-			useResumeFlag := (s.resumeID != "") && a.persistent
-			restoreOnly := (s.resumeID != "") && !a.persistent
 
 			var runErr error
 			if s.useTmux {
@@ -599,7 +636,7 @@ func (a *App) runToolPhase(s *shellState) session.Phase {
 					fmt.Fprintf(os.Stderr, "Resume mode: Persistent session\n")
 				}
 				fmt.Fprintf(os.Stderr, "\n")
-				runErr = a.runCLIInTmux(s.result, s.sessionID, background, useResumeFlag, restoreOnly, s.sessionsDir, s.resumeID, s.toolInstance)
+				runErr = a.enterTmux(s.result, tl, background)
 			} else {
 				fmt.Fprintf(os.Stderr, "Mode: Direct (no tmux)\n")
 				if restoreOnly {
@@ -608,7 +645,7 @@ func (a *App) runToolPhase(s *shellState) session.Phase {
 					fmt.Fprintf(os.Stderr, "Resume mode: Persistent session\n")
 				}
 				fmt.Fprintf(os.Stderr, "\n")
-				runErr = a.runCLI(s.result, s.sessionID, useResumeFlag, restoreOnly, s.sessionsDir, s.resumeID, s.toolInstance)
+				runErr = runDirect(s.result, dl)
 			}
 
 			// Normalise expected exit conditions so the pipeline doesn't log

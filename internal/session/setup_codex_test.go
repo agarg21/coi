@@ -3,6 +3,7 @@ package session
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -72,8 +73,20 @@ func TestSetupCLIConfig_Codex_SeedsFilesVerbatim(t *testing.T) {
 	}
 
 	mgr := newFakeCodexSetupManager()
-	if err := setupCLIConfig(mgr, hostDir, "/home/code", codexToolWithConfigDirFiles(t), func(string) {}); err != nil {
+	copied, err := setupCLIConfig(mgr, hostDir, "/home/code", codexToolWithConfigDirFiles(t), func(string) {})
+	if err != nil {
 		t.Fatalf("setupCLIConfig failed: %v", err)
+	}
+	// The copied files are returned for the grants report (auth.json is the
+	// login token, so it must be among them).
+	gotCopied := map[string]string{}
+	for _, c := range copied {
+		gotCopied[c.ContainerPath] = c.HostPath
+	}
+	for _, name := range []string{"config.toml", "auth.json", "AGENTS.md"} {
+		if gotCopied["/home/code/.codex/"+name] != filepath.Join(hostDir, name) {
+			t.Errorf("copied = %+v, missing %s", copied, name)
+		}
 	}
 
 	for name, want := range map[string]string{
@@ -115,7 +128,7 @@ func TestSetupCLIConfig_Codex_MissingHostFilesSkipped(t *testing.T) {
 	var logs []string
 	logger := func(msg string) { logs = append(logs, msg) }
 
-	if err := setupCLIConfig(mgr, hostDir, "/home/code", codexToolWithConfigDirFiles(t), logger); err != nil {
+	if _, err := setupCLIConfig(mgr, hostDir, "/home/code", codexToolWithConfigDirFiles(t), logger); err != nil {
 		t.Fatalf("setupCLIConfig must tolerate missing host files, got: %v", err)
 	}
 	if len(mgr.files) != 0 {
@@ -146,8 +159,13 @@ func TestInjectCredentials_Codex_RefreshesWithoutSettingsWrite(t *testing.T) {
 	// Simulate in-container state from the previous session.
 	mgr.files["/home/code/.codex/auth.json"] = `{"tokens": {"access_token": "stale"}}`
 
-	if err := injectCredentials(mgr, hostDir, "/home/code", codexToolWithConfigDirFiles(t), func(string) {}); err != nil {
+	copied, err := injectCredentials(mgr, hostDir, "/home/code", codexToolWithConfigDirFiles(t), func(string) {})
+	if err != nil {
 		t.Fatalf("injectCredentials failed: %v", err)
+	}
+	wantCopied := []CredentialEntry{{HostPath: filepath.Join(hostDir, "auth.json"), ContainerPath: "/home/code/.codex/auth.json"}}
+	if !reflect.DeepEqual(copied, wantCopied) {
+		t.Errorf("injectCredentials copied = %+v, want %+v", copied, wantCopied)
 	}
 
 	if got := mgr.files["/home/code/.codex/auth.json"]; got != refreshedAuth {

@@ -17,17 +17,23 @@ func (st *setupState) phaseResumeRestore(_ context.Context) (Teardown, error) {
 	if st.opts.ResumeFromID != "" && st.opts.Tool != nil && st.opts.Tool.ConfigDirName() != "" {
 		// If we launched a new container (not reusing persistent one), restore config from saved session
 		if !st.skipLaunch && st.opts.SessionsDir != "" {
-			if err := restoreSessionData(st.result.Manager, st.opts.ResumeFromID, st.result.HomeDir, st.opts.SessionsDir, st.opts.Tool, st.opts.Logger); err != nil {
+			pushed, err := restoreSessionData(st.result.Manager, st.opts.ResumeFromID, st.result.HomeDir, st.opts.SessionsDir, st.opts.Tool, st.opts.Logger)
+			if err != nil {
 				st.opts.Logger(fmt.Sprintf("Warning: Could not restore session data: %v", err))
+			}
+			if pushed {
+				st.restoredFiles = restoredToolFiles(st.opts.SessionsDir, st.opts.ResumeFromID, st.result.HomeDir, st.opts.Tool)
 			}
 		}
 
 		// Always inject fresh credentials/sandbox settings when resuming
 		if tcf, ok := st.opts.Tool.(tool.ToolWithConfigDirFiles); ok {
 			if st.opts.CLIConfigPath != "" || tcf.AlwaysSetupConfig() {
-				if err := injectCredentials(st.result.Manager, st.opts.CLIConfigPath, st.result.HomeDir, tcf, st.opts.Logger); err != nil {
+				copied, err := injectCredentials(st.result.Manager, st.opts.CLIConfigPath, st.result.HomeDir, tcf, st.opts.Logger)
+				if err != nil {
 					st.opts.Logger(fmt.Sprintf("Warning: Could not inject credentials: %v", err))
 				}
+				st.toolFiles = copied
 			}
 		}
 	}
@@ -38,9 +44,11 @@ func (st *setupState) phaseResumeRestore(_ context.Context) (Teardown, error) {
 	// session it's applied once at phaseSetupCredentials alongside CLI tool config.
 	if st.opts.ResumeFromID != "" && st.opts.CredentialConfig != nil && len(st.opts.CredentialConfig.Entries) > 0 {
 		st.opts.Logger("Refreshing configured credentials...")
-		if err := setupCredentials(st.result.Manager, st.result.HomeDir, st.opts.CredentialConfig.Entries, st.opts.Logger); err != nil {
+		copied, err := setupCredentials(st.result.Manager, st.result.HomeDir, st.opts.CredentialConfig.Entries, st.opts.Logger)
+		if err != nil {
 			st.opts.Logger(fmt.Sprintf("Warning: Could not refresh credentials: %v", err))
 		}
+		st.copiedCredentials = copied
 	}
 	return nil, nil
 }
@@ -69,6 +77,16 @@ func (st *setupState) phaseMountsAndContextPath(_ context.Context) (Teardown, er
 	return nil, nil
 }
 
+// seedToolConfig copies the tool's config in and records the copied files for
+// the grants report.
+func (st *setupState) seedToolConfig(tcf tool.ToolWithConfigDirFiles) {
+	copied, err := setupCLIConfig(st.result.Manager, st.opts.CLIConfigPath, st.result.HomeDir, tcf, st.opts.Logger)
+	if err != nil {
+		st.opts.Logger(fmt.Sprintf("Warning: Failed to setup %s config: %v", st.opts.Tool.Name(), err))
+	}
+	st.toolFiles = copied
+}
+
 // 11. Setup CLI tool config (skip if resuming — config already restored).
 func (st *setupState) phaseSetupCLIConfig(_ context.Context) (Teardown, error) {
 	if st.opts.Tool != nil {
@@ -81,9 +99,7 @@ func (st *setupState) phaseSetupCLIConfig(_ context.Context) (Teardown, error) {
 					switch {
 					case !st.skipLaunch:
 						st.opts.Logger(fmt.Sprintf("Setting up %s config...", st.opts.Tool.Name()))
-						if err := setupCLIConfig(st.result.Manager, st.opts.CLIConfigPath, st.result.HomeDir, tcf, st.opts.Logger); err != nil {
-							st.opts.Logger(fmt.Sprintf("Warning: Failed to setup %s config: %v", st.opts.Tool.Name(), err))
-						}
+						st.seedToolConfig(tcf)
 					case !toolConfigSeeded(st.result.Manager, st.result.HomeDir, tcf):
 						// Persistent reuse with a tool coi hasn't seeded in this
 						// container yet — e.g. a profile that shares [container]
@@ -95,9 +111,7 @@ func (st *setupState) phaseSetupCLIConfig(_ context.Context) (Teardown, error) {
 						// its config once so it authenticates, without touching the
 						// original tool's config or conversation history.
 						st.opts.Logger(fmt.Sprintf("Setting up %s config in reused container (first use of this tool here)...", st.opts.Tool.Name()))
-						if err := setupCLIConfig(st.result.Manager, st.opts.CLIConfigPath, st.result.HomeDir, tcf, st.opts.Logger); err != nil {
-							st.opts.Logger(fmt.Sprintf("Warning: Failed to setup %s config: %v", st.opts.Tool.Name(), err))
-						}
+						st.seedToolConfig(tcf)
 					default:
 						st.opts.Logger(fmt.Sprintf("Reusing existing %s config (persistent container)", st.opts.Tool.Name()))
 					}
@@ -120,6 +134,9 @@ func (st *setupState) phaseApplyToolEnv(ctx context.Context) (Teardown, error) {
 	if st.opts.Tool != nil {
 		applyToolContainerEnv(ctx, st.result.ContainerName, st.result.ContainerWorkspacePath, st.opts.Tool, st.opts.Logger)
 	}
+	// The last instance-config write of setup: read the applied config now,
+	// in the background, overlapping the file copies that follow.
+	st.startAppliedRead()
 	return nil, nil
 }
 
@@ -127,9 +144,11 @@ func (st *setupState) phaseApplyToolEnv(ctx context.Context) (Teardown, error) {
 func (st *setupState) phaseSetupCredentials(_ context.Context) (Teardown, error) {
 	if !st.skipLaunch && st.opts.ResumeFromID == "" && st.opts.CredentialConfig != nil && len(st.opts.CredentialConfig.Entries) > 0 {
 		st.opts.Logger("Setting up configured credentials...")
-		if err := setupCredentials(st.result.Manager, st.result.HomeDir, st.opts.CredentialConfig.Entries, st.opts.Logger); err != nil {
+		copied, err := setupCredentials(st.result.Manager, st.result.HomeDir, st.opts.CredentialConfig.Entries, st.opts.Logger)
+		if err != nil {
 			st.opts.Logger(fmt.Sprintf("Warning: Failed to setup credentials: %v", err))
 		}
+		st.copiedCredentials = copied
 	}
 	return nil, nil
 }
@@ -138,9 +157,47 @@ func (st *setupState) phaseSetupCredentials(_ context.Context) (Teardown, error)
 // that support it, the native auto-context file (e.g. Claude's ~/.claude/CLAUDE.md).
 func (st *setupState) phaseInjectContext(_ context.Context) (Teardown, error) {
 	// Runs for both new and resumed sessions so dynamic info stays current.
-	out := injectSandboxContextFiles(st.result, st.opts, st.pendingGuestOps...)
+	// The context files state whether Docker works, from the applied config.
+	st.awaitApplied()
+	// The leftover-file check and the copy record ride along first, so a
+	// later failing op can't cut them short. The check skips this launch's
+	// copies, and runs before they are recorded.
+	var ops []guestOp
+	if op, ok := st.planLeftoverCheck(); ok {
+		ops = append(ops, op)
+	}
+	if !st.skipLaunch {
+		// A container setup just created: the manifest covers every copy.
+		ops = append(ops, markManifestCompleteOp())
+	}
+	if op, ok := recordCopiesOp(st.copiesThisLaunch()); ok {
+		ops = append(ops, op)
+	}
+	ops = append(ops, st.pendingGuestOps...)
+	out, ctxInfo := injectSandboxContextFiles(st.result, st.opts, ops...)
+	st.leftovers.parse(out)
+	st.contextInfo = ctxInfo
 	st.pendingGuestOps = nil
 	reportTimezone(out, st.opts.Timezone, st.opts.Logger)
 	reportMiseTrust(out, st.opts.Logger)
 	return nil, nil
+}
+
+// restoredToolFiles lists the tool's essential config files (its login file
+// among them) that restoreSessionData put back from the saved session, which
+// the report lists so a restored login isn't left out.
+func restoredToolFiles(sessionsDir, resumeID, homeDir string, t tool.Tool) []CredentialEntry {
+	tcf, ok := t.(tool.ToolWithConfigDirFiles)
+	if !ok {
+		return nil
+	}
+	saved := filepath.Join(sessionsDir, resumeID, tcf.ConfigDirName())
+	essential, _ := toolHostFiles(saved, homeDir, tcf)
+	var out []CredentialEntry
+	for _, f := range essential {
+		if _, err := os.Stat(f.HostPath); err == nil {
+			out = append(out, f)
+		}
+	}
+	return out
 }

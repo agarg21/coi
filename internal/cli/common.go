@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"sort"
 	"syscall"
 
 	"github.com/coipond/coi/internal/alias"
@@ -55,15 +56,29 @@ func stderrLogFn(msg string) {
 // (freshly minted per session, fatal on error). Shared by coi shell
 // (buildContainerEnv) and coi run (appendEnvArgs) so the precedence and the
 // unset-var warning can't drift between the two launch paths.
-func (a *App) applyConfigEnv(env map[string]string) error {
+//
+// It returns which layer each variable it set came from (the layer that won),
+// for the startup grants report; callers that don't report ignore it.
+func (a *App) applyConfigEnv(env map[string]string) (session.EnvGrants, error) {
+	// The layer that last set each variable; later layers overwrite earlier.
+	const (
+		configured = iota
+		fromHost
+		minted
+	)
+	layer := map[string]int{}
+	set := func(k, v string, l int) {
+		env[k] = v
+		layer[k] = l
+	}
 	// Static environment from config (defaults.environment + profile environment)
 	for k, v := range a.cfg.Defaults.Environment {
-		env[k] = v
+		set(k, v, configured)
 	}
 	// Resolve forward_env from config, look up host values
 	for _, name := range a.cfg.Defaults.ForwardEnv {
 		if val, ok := os.LookupEnv(name); ok {
-			env[name] = val
+			set(name, val, fromHost)
 		} else {
 			fmt.Fprintf(os.Stderr, "Warning: forward_env variable %q is not set on host, skipping\n", name)
 		}
@@ -71,12 +86,27 @@ func (a *App) applyConfigEnv(env map[string]string) error {
 	// Command-sourced env vars (highest precedence — freshly minted per session).
 	envCommandValues, err := a.resolveEnvCommands()
 	if err != nil {
-		return err
+		return session.EnvGrants{}, err
 	}
 	for k, v := range envCommandValues {
-		env[k] = v
+		set(k, v, minted)
 	}
-	return nil
+
+	var g session.EnvGrants
+	for k, l := range layer {
+		switch l {
+		case configured:
+			g.Configured = append(g.Configured, k)
+		case fromHost:
+			g.FromHost = append(g.FromHost, k)
+		case minted:
+			g.Minted = append(g.Minted, k)
+		}
+	}
+	sort.Strings(g.Configured)
+	sort.Strings(g.FromHost)
+	sort.Strings(g.Minted)
+	return g, nil
 }
 
 // runPipelineWithSignals installs a SIGINT/SIGTERM handler that triggers

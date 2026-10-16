@@ -126,7 +126,28 @@ type SetupResult struct {
 	PublishedPorts         []PublishedPort   // ports published on the host this session (for the context file)
 	Timezone               string            // Resolved timezone applied to the container (empty = UTC)
 	HasImmutableProtection bool              // True if host-side immutable attribute was applied to protected paths
+	Grants                 *Grants           // Effective reach of the session, for the startup report
+	// applied is the container's applied config, read at the end of setup
+	// (nil if unreadable); the context files and the grants report use it.
+	applied *container.AppliedState
+	// worktreeWritableHooks is whether setup left a worktree's common-dir
+	// hooks writable (git.writable_hooks), decided before the protected-path
+	// list is replaced by the effective one (which drops .git/* for a
+	// worktree); the grants report's fallback lists the same protections.
+	worktreeWritableHooks bool
 }
+
+// TmuxSessionName is the tmux session coi runs the tool in.
+func TmuxSessionName(containerName string) string { return "coi-" + containerName }
+
+// TmuxSessionTarget is the tool's tmux session as an exact-match target
+// (`-t` for session commands): a bare name also matches any session it
+// prefixes, such as a user's "coi-<container>-dev".
+func TmuxSessionTarget(containerName string) string { return "=" + TmuxSessionName(containerName) }
+
+// TmuxPaneTarget is the exact-match target of the session's active pane (`-t`
+// for pane commands like send-keys and capture-pane).
+func TmuxPaneTarget(containerName string) string { return TmuxSessionTarget(containerName) + ":" }
 
 // Setup initializes a container for a Claude session.
 //
@@ -186,6 +207,7 @@ func Setup(ctx context.Context, opts SetupOptions) (*SetupResult, error) {
 		return nil, err
 	}
 
+	st.result.Grants = buildGrants(st)
 	st.opts.Logger("Container setup complete!")
 	return st.result, nil
 }
@@ -472,6 +494,7 @@ func restartStoppedContainer(result *SetupResult, opts *SetupOptions, containerN
 		opts.Logger(fmt.Sprintf("Warning: git worktree not resolved (%v); its git dirs are skipped by the UID-mapping check and git commands may fail in the container", reuseWtErr))
 	}
 	reuseWritableHooks := !containsGitHooksPath(opts.Security.ProtectedPaths)
+	result.worktreeWritableHooks = reuseWritableHooks
 	secDevices := NewSecurityDeviceReconciler(result.Manager, opts.Logger)
 	// Reconcile the kernel-surface policy while the container is stopped —
 	// the only window where security.nesting and security.syscalls.deny can
@@ -604,6 +627,7 @@ func createAndStartContainer(result *SetupResult, opts *SetupOptions, image, con
 		opts.Logger(fmt.Sprintf("Warning: git worktree not mounted (%v); git commands may fail in the container", wtErr))
 	}
 	worktreeWritableHooks := !containsGitHooksPath(opts.Security.ProtectedPaths)
+	result.worktreeWritableHooks = worktreeWritableHooks
 
 	// Configure UID/GID mapping for the workspace bind mount. Shared with
 	// the run pipeline via ConfigureUIDMapping so both honor Colima/Lima
@@ -801,7 +825,33 @@ func createAndStartContainer(result *SetupResult, opts *SetupOptions, image, con
 // facts, injects ~/SANDBOX_CONTEXT.md (and the optional .json companion), and
 // returns the rendered context content for the auto-context step. Extracted
 // verbatim from Setup's phase-12 block.
-func sandboxContextOps(result *SetupResult, opts SetupOptions) (string, []guestOp) {
+func sandboxContextOps(result *SetupResult, opts SetupOptions) (string, []guestOp, tool.ContextInfo) {
+	ctxInfo := contextInfoFor(result, opts)
+	contextContent := resolveContextContent(ctxInfo, opts.Context.FilePath, opts.Logger)
+	var ops []guestOp
+	if op, err := contextFileOp(ctxInfo, opts.Context.FilePath, result.HomeDir, opts.Logger); err != nil {
+		opts.Logger(fmt.Sprintf("Warning: Failed to inject context file: %v", err))
+	} else {
+		ops = append(ops, op)
+	}
+	// Machine-readable companion for programmatic consumers (#705), enabled
+	// by default. Written from ctxInfo (the real facts) unless [tool]
+	// context_json_file provides a custom JSON to inject verbatim; disable
+	// entirely with context_json = false.
+	if config.BoolVal(opts.Context.JSON) {
+		if op, err := contextJSONFileOp(ctxInfo, opts.Context.JSONFilePath, result.HomeDir, opts.Logger); err != nil {
+			opts.Logger(fmt.Sprintf("Warning: Failed to inject context JSON file: %v", err))
+		} else {
+			ops = append(ops, op)
+		}
+	}
+	return contextContent, ops, ctxInfo
+}
+
+// contextInfoFor builds the tool.ContextInfo from the resolved session facts.
+// Shared by the sandbox context files and the startup grants report, so the
+// agent and the user are told the same thing.
+func contextInfoFor(result *SetupResult, opts SetupOptions) tool.ContextInfo {
 	networkMode := ""
 	var allowedPorts []int
 	var dnsServers, allowedDomains []string
@@ -851,7 +901,7 @@ func sandboxContextOps(result *SetupResult, opts SetupOptions) (string, []guestO
 		}
 	}
 
-	ctxInfo := tool.ContextInfo{
+	return tool.ContextInfo{
 		WorkspacePath:      result.ContainerWorkspacePath,
 		HomeDir:            result.HomeDir,
 		Persistent:         opts.Persistent,
@@ -874,27 +924,8 @@ func sandboxContextOps(result *SetupResult, opts SetupOptions) (string, []guestO
 		ToolName:           toolName,
 		ContainerName:      result.ContainerName,
 		ProfileContext:     profileContext,
-		DockerUnavailable:  !hardeningPolicyFrom(&opts).DockerEnabled(),
+		DockerUnavailable:  dockerUnavailable(result, opts),
 	}
-	contextContent := resolveContextContent(ctxInfo, opts.Context.FilePath, opts.Logger)
-	var ops []guestOp
-	if op, err := contextFileOp(ctxInfo, opts.Context.FilePath, result.HomeDir, opts.Logger); err != nil {
-		opts.Logger(fmt.Sprintf("Warning: Failed to inject context file: %v", err))
-	} else {
-		ops = append(ops, op)
-	}
-	// Machine-readable companion for programmatic consumers (#705), enabled
-	// by default. Written from ctxInfo (the real facts) unless [tool]
-	// context_json_file provides a custom JSON to inject verbatim; disable
-	// entirely with context_json = false.
-	if config.BoolVal(opts.Context.JSON) {
-		if op, err := contextJSONFileOp(ctxInfo, opts.Context.JSONFilePath, result.HomeDir, opts.Logger); err != nil {
-			opts.Logger(fmt.Sprintf("Warning: Failed to inject context JSON file: %v", err))
-		} else {
-			ops = append(ops, op)
-		}
-	}
-	return contextContent, ops
 }
 
 // injectSandboxContextFiles writes ~/SANDBOX_CONTEXT.md, the optional .json,
@@ -903,9 +934,10 @@ func sandboxContextOps(result *SetupResult, opts SetupOptions) (string, []guestO
 // dynamic info stays current.
 //
 // preOps run first in the same exec (other phases' deferred steps); the
-// combined output is returned so their callers can report what happened.
-func injectSandboxContextFiles(result *SetupResult, opts SetupOptions, preOps ...guestOp) string {
-	contextContent, contextOps := sandboxContextOps(result, opts)
+// combined output is returned so their callers can report what happened,
+// along with the context facts the files were written from.
+func injectSandboxContextFiles(result *SetupResult, opts SetupOptions, preOps ...guestOp) (string, tool.ContextInfo) {
+	contextContent, contextOps, ctxInfo := sandboxContextOps(result, opts)
 	ops := append(append([]guestOp{}, preOps...), contextOps...)
 
 	if opts.Tool != nil && config.BoolVal(opts.Context.Auto) && contextContent != "" {
@@ -918,19 +950,31 @@ func injectSandboxContextFiles(result *SetupResult, opts SetupOptions, preOps ..
 		}
 	}
 	if len(ops) == 0 {
-		return ""
+		return "", ctxInfo
 	}
 	out, err := runGuestOpsOutput(result.Manager, ops, container.ExecCommandOptions{})
 	if err != nil {
 		opts.Logger(fmt.Sprintf("Warning: Failed to write sandbox context files: %v", err))
-		return out
+		return out, ctxInfo
 	}
 	for _, op := range ops {
 		if op.write != nil {
 			opts.Logger(fmt.Sprintf("Context file injected at %s", op.write.path))
 		}
 	}
-	return out
+	return out, ctxInfo
+}
+
+// dockerUnavailable follows the container's nesting when setup read it (a
+// reused container keeps what it was created with, and an Incus profile can
+// set it), else the hardening policy config asks for.
+func dockerUnavailable(result *SetupResult, opts SetupOptions) bool {
+	if result != nil && result.applied != nil {
+		// Docker needs nesting, and can't run under reduce_kernel_surface's
+		// syscall denies (which win over docker in coi's own policy).
+		return !result.applied.Nesting || result.applied.KernelSurfaceDenied
+	}
+	return !hardeningPolicyFrom(&opts).DockerEnabled()
 }
 
 // remapContainerUser remaps the container's `code` user to a non-default

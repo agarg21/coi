@@ -5,6 +5,7 @@ package container
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -15,6 +16,7 @@ import (
 	"os/exec"
 	"os/user"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -210,6 +212,9 @@ func (m *Manager) DeviceConfig(name string) (map[string]string, bool) {
 type DiskDevice struct {
 	Source, Path    string
 	Shift, Readonly bool
+	// Pool is set for a storage-pool volume, whose Source names the volume
+	// rather than a host path. Empty for host-path disks, coi's own included.
+	Pool string
 }
 
 // DiskDevices returns the container's own (non-profile) disk devices by name,
@@ -220,6 +225,87 @@ func (m *Manager) DiskDevices() (map[string]DiskDevice, error) {
 		return nil, err
 	}
 	return diskDevicesFrom(devices), nil
+}
+
+// AppliedState is what an instance actually runs with, profile-inherited
+// settings included, for reporting what a session was granted.
+type AppliedState struct {
+	Disks    map[string]DiskDevice // every disk, the container's own and its profiles'
+	EnvNames []string              // environment.* keys, sorted; names only
+	Nesting  bool                  // security.nesting, which Docker needs
+	// NestingSet is set when security.nesting is set at all (else Nesting
+	// is Incus's default, off).
+	NestingSet bool
+	// KernelSurfaceDenied is set when security.syscalls.deny holds the
+	// reduce_kernel_surface denies, which Docker can't run under.
+	KernelSurfaceDenied bool
+	// RootPool is the storage pool of the root disk ("" if unknown).
+	RootPool string
+	// Limits are the resource limits in force, by the key coi sets them
+	// under: the limits.* instance keys, plus the root disk's limits.read,
+	// limits.write, limits.max and size as "root.<key>".
+	Limits map[string]string
+}
+
+// LimitKeys are the AppliedState.Limits keys, in reporting order.
+var LimitKeys = []string{
+	"limits.cpu", "limits.cpu.allowance", "limits.cpu.priority",
+	"limits.memory", "limits.memory.enforce", "limits.memory.swap",
+	"limits.processes",
+	"root.limits.read", "root.limits.write", "root.limits.max", "root.limits.disk.priority", "root.size",
+}
+
+// AppliedState reads the instance's expanded config, from one
+// `incus config show --expanded` (shared with the other cached reads).
+func (m *Manager) AppliedState() (AppliedState, error) {
+	ctx := context.Background()
+	c, ok := loadInstanceConfig(ctx, m.ContainerName, true)
+	if !ok {
+		return AppliedState{}, fmt.Errorf("could not read the expanded config of %s", m.ContainerName)
+	}
+	st := AppliedState{
+		Disks:   diskDevicesFrom(c.devices),
+		Nesting: isTrue(c.config["security.nesting"]),
+		Limits:  map[string]string{},
+	}
+	_, st.NestingSet = c.config["security.nesting"]
+	denied := kernelSurfaceDenySyscallSet(c.config["security.syscalls.deny"])
+	for _, name := range strings.Fields(KernelSurfaceDenySyscalls) {
+		if denied[name] {
+			st.KernelSurfaceDenied = true
+			break
+		}
+	}
+	st.RootPool = c.devices["root"]["pool"]
+	for k := range c.config {
+		if name, ok := strings.CutPrefix(k, "environment."); ok && name != "" {
+			st.EnvNames = append(st.EnvNames, name)
+		}
+	}
+	sort.Strings(st.EnvNames)
+	for _, k := range LimitKeys {
+		v := c.config[k]
+		if dk, ok := strings.CutPrefix(k, "root."); ok {
+			v = c.devices["root"][dk]
+		}
+		if v != "" {
+			st.Limits[k] = v
+		}
+	}
+	return st, nil
+}
+
+// NestingSetLocally reports whether the instance sets security.nesting in its
+// own config (rather than inheriting it from an Incus profile, which a restart
+// won't change). ok is false when the config can't be read. A separate read,
+// needed only when the applied nesting disagrees with config.
+func (m *Manager) NestingSetLocally() (set, ok bool) {
+	local, ok := loadInstanceConfig(context.Background(), m.ContainerName, false)
+	if !ok {
+		return false, false
+	}
+	_, set = local.config["security.nesting"]
+	return set, true
 }
 
 // ParseDiskDevices extracts the disk devices from `incus config show` YAML.
@@ -245,6 +331,7 @@ func diskDevicesFrom(devices map[string]map[string]string) map[string]DiskDevice
 			Path:     d["path"],
 			Shift:    isTrue(d["shift"]),
 			Readonly: isTrue(d["readonly"]),
+			Pool:     d["pool"],
 		}
 	}
 	return disks
