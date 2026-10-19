@@ -21,6 +21,7 @@
 - [Bug Fix] **README profile example loads again (#890)** — the `[limits]` example set `cpu = "4"` and `memory = "8GiB"` directly, which fails to load; it now uses `[limits.cpu] count` and `[limits.memory] limit`. A test now checks that every TOML example in the README loads. Stale comments in the shipped config files are fixed too: the default config named a nonexistent `writable_agent_config` (the opt-out is `writable_paths`), the starter config's disk rate example `"10MiB/s"` failed validation, and the nftables-unavailable hint pointed at the workspace `.coi/config.toml`, which can't change the network mode.
 - [Bug Fix] **`coi audit` prints the security monitor's records** — dumping a container's audit log (or a file with `--file`) printed nothing, because the monitor's threat events and snapshots were silently dropped as unrecognized. They are now printed as written.
 - [Bug Fix] **`auto_pause_on_high` and `auto_kill_on_critical` apply to network threats** — the nftables network monitor always paused on HIGH and killed on CRITICAL, so setting either to `false` only affected the process monitor. Both settings now govern network threats too; both still default to `true`.
+- [Bug Fix] **`coi tool spec --help` describes `env` correctly** — the help said `env` holds only model and effort settings; for pi, omp and opencode it also holds the session-dir and XDG redirects to the workspace.
 
 ## 0.15.0 (2026-10-12)
 
