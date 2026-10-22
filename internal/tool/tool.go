@@ -449,6 +449,23 @@ type ToolWithContainerEnv interface {
 	GetContainerEnv(workspacePath string) map[string]string
 }
 
+// ToolWithContainerSessionDiscovery is an optional interface for tools whose
+// sessions live in a store that only the tool can read in the container (e.g.
+// opencode's SQLite DB under ~/.local/share/opencode), so DiscoverSessionID
+// cannot find them in the saved state on the host. On resume coi runs
+// SessionDiscoveryCommand in the container (with the tool's container env)
+// and passes its stdout to SetSessionDiscoveryOutput; DiscoverSessionID then
+// returns the session found there.
+type ToolWithContainerSessionDiscovery interface {
+	Tool
+	// SessionDiscoveryCommand returns the argv that prints the latest session
+	// of workspacePath (the mount point inside the container), or nil to skip
+	// the lookup.
+	SessionDiscoveryCommand(workspacePath string) []string
+	// SetSessionDiscoveryOutput stores the session ID found in output.
+	SetSessionDiscoveryOutput(output string)
+}
+
 // DataDir is a tool data directory inside the container that must outlive an
 // ephemeral container but must NOT live in the workspace.
 type DataDir struct {
