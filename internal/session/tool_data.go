@@ -26,9 +26,10 @@ func ToolDataBaseDir(coiDir string, t tool.Tool, workspacePath string) string {
 // with per-workspace host dirs under coiDir, or nil when t has none. They are
 // coi-generated, so always trusted, and writable.
 //
-// MigrateFrom points at where coi versions before #929 kept the same dir: in
-// the workspace, via XDG_DATA_HOME/XDG_STATE_HOME=<workspace>/.local/... —
-// PrepareMountSource moves that data over the first time the mount is added.
+// For a dir marked FromWorkspace, MigrateFrom points at where coi versions
+// before #929 kept it: in the workspace, via
+// XDG_DATA_HOME/XDG_STATE_HOME=<workspace>/.local/... — PrepareMountSource
+// moves that data over the first time the mount is added.
 func ToolDataMounts(coiDir string, t tool.Tool, workspacePath string) []MountEntry {
 	tdd, ok := t.(tool.ToolWithDataDirs)
 	if !ok {
@@ -38,12 +39,15 @@ func ToolDataMounts(coiDir string, t tool.Tool, workspacePath string) []MountEnt
 	home := "/home/" + container.CodeUser
 	var mounts []MountEntry
 	for _, d := range tdd.DataDirs() {
-		mounts = append(mounts, MountEntry{
+		m := MountEntry{
 			HostPath:      filepath.Join(base, d.Name),
 			ContainerPath: filepath.Join(home, d.HomeRelPath),
 			DeviceName:    fmt.Sprintf("%s%s-%s", toolDataDevicePrefix, t.Name(), d.Name),
-			MigrateFrom:   filepath.Join(workspacePath, d.HomeRelPath),
-		})
+		}
+		if d.FromWorkspace {
+			m.MigrateFrom = filepath.Join(workspacePath, d.HomeRelPath)
+		}
+		mounts = append(mounts, m)
 	}
 	return mounts
 }
@@ -117,6 +121,9 @@ func migrateMountSource(from, to string, logger func(string)) {
 // (opencode and opencode2 both use ~/.local/share/opencode) is removed first:
 // two disk devices can't share a path, so a tool switch would otherwise leave
 // the container unable to start. Its data stays in that tool's host dir.
+// A new mount without MigrateFrom covers a dir that older coi left in the
+// container (opencode2's plan dir in coi 0.16), so what the container holds
+// there is copied to the host dir first; the mount would hide it otherwise.
 // [[mounts]] devices are otherwise never re-added on reuse; these are coi's
 // own, so converging them is safe. mgr must be able to list its disk devices;
 // when it can't, nothing is done.
@@ -126,7 +133,7 @@ func AttachMissingToolDataMounts(mgr container.ContainerDevices, mc *MountConfig
 	}
 	var wanted []MountEntry
 	for _, m := range mc.Mounts {
-		if m.MigrateFrom != "" {
+		if strings.HasPrefix(m.DeviceName, toolDataDevicePrefix) {
 			wanted = append(wanted, m)
 		}
 	}
@@ -158,10 +165,14 @@ func AttachMissingToolDataMounts(mgr container.ContainerDevices, mc *MountConfig
 		}
 	}
 	for _, m := range wanted {
+		_, attached := disks[m.DeviceName]
+		if !attached && m.MigrateFrom == "" {
+			copyContainerDataDir(mgr, m, logger)
+		}
 		if err := PrepareMountSource(m, logger); err != nil {
 			return err
 		}
-		if _, attached := disks[m.DeviceName]; attached {
+		if attached {
 			continue
 		}
 		logger(fmt.Sprintf("Adding mount: %s -> %s", m.HostPath, m.ContainerPath))
@@ -170,4 +181,76 @@ func AttachMissingToolDataMounts(mgr container.ContainerDevices, mc *MountConfig
 		}
 	}
 	return nil
+}
+
+// containerDirPuller reads a stopped container's files (the files API, no
+// exec).
+type containerDirPuller interface {
+	PathKind(p string) (container.PathKind, error)
+	PullDirectory(containerPath, localPath string) error
+}
+
+// copyContainerDataDir copies m's container dir into its host dir. The host
+// dir is shared by every container on the workspace (one per slot), so it may
+// already hold data: only entries it lacks are moved in, and the rest are
+// skipped, never overwritten. A failed copy only warns: the data stays in the
+// container, hidden by the mount.
+func copyContainerDataDir(mgr container.ContainerDevices, m MountEntry, logger func(string)) {
+	puller, ok := mgr.(containerDirPuller)
+	if !ok {
+		return
+	}
+	kind, err := puller.PathKind(m.ContainerPath)
+	if err != nil {
+		logger(fmt.Sprintf("Warning: could not check %s in the container (%v); its data is hidden by the new mount", m.ContainerPath, err))
+		return
+	}
+	if kind != container.PathDir {
+		return
+	}
+	warn := func(err error) {
+		logger(fmt.Sprintf("Warning: could not copy %s from the container to %s (%v); its data is hidden by the new mount", m.ContainerPath, m.HostPath, err))
+	}
+	// Pull next to the host dir, so the moves below are renames on one
+	// filesystem.
+	if err := os.MkdirAll(filepath.Dir(m.HostPath), 0o755); err != nil {
+		warn(err)
+		return
+	}
+	tmp, err := os.MkdirTemp(filepath.Dir(m.HostPath), ".pull-*")
+	if err != nil {
+		warn(err)
+		return
+	}
+	defer os.RemoveAll(tmp)
+	pulled := filepath.Join(tmp, filepath.Base(m.HostPath))
+	if err := puller.PullDirectory(m.ContainerPath, pulled); err != nil {
+		warn(err)
+		return
+	}
+	if _, err := os.Lstat(m.HostPath); errors.Is(err, os.ErrNotExist) {
+		if err := os.Rename(pulled, m.HostPath); err != nil {
+			warn(err)
+			return
+		}
+		logger(fmt.Sprintf("Copied tool data out of the container: %s -> %s", m.ContainerPath, m.HostPath))
+		return
+	}
+	entries, err := os.ReadDir(pulled)
+	if err != nil {
+		warn(err)
+		return
+	}
+	for _, e := range entries {
+		dst := filepath.Join(m.HostPath, e.Name())
+		if _, err := os.Lstat(dst); err == nil || !errors.Is(err, os.ErrNotExist) {
+			logger(fmt.Sprintf("Warning: %s already exists; %s/%s stays hidden in the container", dst, m.ContainerPath, e.Name()))
+			continue
+		}
+		if err := os.Rename(filepath.Join(pulled, e.Name()), dst); err != nil {
+			warn(err)
+			return
+		}
+	}
+	logger(fmt.Sprintf("Copied tool data out of the container: %s -> %s", m.ContainerPath, m.HostPath))
 }
