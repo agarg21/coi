@@ -135,6 +135,9 @@ type SetupResult struct {
 	// list is replaced by the effective one (which drops .git/* for a
 	// worktree); the grants report's fallback lists the same protections.
 	worktreeWritableHooks bool
+	// nestedGitScan is the nested git walk Setup started early, consumed by
+	// the security mounts.
+	nestedGitScan NestedGitScan
 }
 
 // TmuxSessionName is the tmux session coi runs the tool in.
@@ -148,6 +151,16 @@ func TmuxSessionTarget(containerName string) string { return "=" + TmuxSessionNa
 // TmuxPaneTarget is the exact-match target of the session's active pane (`-t`
 // for pane commands like send-keys and capture-pane).
 func TmuxPaneTarget(containerName string) string { return TmuxSessionTarget(containerName) + ":" }
+
+// startSetupNestedGitScan starts the nested git walk, which reads the whole
+// tree to a bounded depth, so it overlaps the Incus calls before the security
+// mounts. Nothing is started when protection is disabled (the zero value).
+func startSetupNestedGitScan(opts SetupOptions) NestedGitScan {
+	if opts.WorkspacePath == "" || (opts.Security.Config != nil && opts.Security.Config.DisableProtection) {
+		return NestedGitScan{}
+	}
+	return StartNestedGitScan(opts.WorkspacePath)
+}
 
 // Setup initializes a container for a Claude session.
 //
@@ -164,7 +177,7 @@ func Setup(ctx context.Context, opts SetupOptions) (*SetupResult, error) {
 		}
 	}
 
-	st := &setupState{opts: opts, result: &SetupResult{}}
+	st := &setupState{opts: opts, result: &SetupResult{nestedGitScan: startSetupNestedGitScan(opts)}}
 
 	pipe := &Pipeline{}
 	if err := pipe.Run(ctx,
@@ -563,7 +576,7 @@ func restartStoppedContainer(result *SetupResult, opts *SetupOptions, containerN
 			return err
 		}
 	}
-	reusePaths, reuseImmutable, reuseErr := applySessionSecurity(secDevices, *opts, reuseCWP, reuseUseShift, reuseLayout, reuseWritableHooks, containerName)
+	reusePaths, reuseImmutable, reuseErr := applySessionSecurity(secDevices, *opts, reuseCWP, reuseUseShift, reuseLayout, reuseWritableHooks, containerName, result.nestedGitScan)
 	secDevices.Finish()
 	opts.Security.ProtectedPaths = reusePaths
 	if reuseImmutable {
@@ -693,7 +706,7 @@ func createAndStartContainer(result *SetupResult, opts *SetupOptions, image, con
 	// secret paths — all via applySessionSecurity, the single implementation shared
 	// with the reuse/restart reconcile below (issue #610). Must be added after the
 	// workspace mount for the overlays to layer on top.
-	effectivePaths, hasImmutable, secErr := applySessionSecurity(result.Manager, *opts, containerWorkspacePath, useShift, worktreeLayout, worktreeWritableHooks, containerName)
+	effectivePaths, hasImmutable, secErr := applySessionSecurity(result.Manager, *opts, containerWorkspacePath, useShift, worktreeLayout, worktreeWritableHooks, containerName, result.nestedGitScan)
 	// Adopt the expanded list as the canonical protected set so downstream
 	// consumers (the SANDBOX_CONTEXT.md "Protected paths" listing built from
 	// opts.Security.ProtectedPaths below) reflect what was actually mounted, including the
