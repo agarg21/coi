@@ -156,9 +156,12 @@ jobs:
       fail-fast: false
       matrix:
         test_group:
-          - name: shell-ephemeral
-            path: tests/shell/ephemeral
-            description: "Ephemeral shell session tests"
+          - name: shell-ephemeral-a
+            path: tests/shell/ephemeral/[a-r]*.py
+            description: "Ephemeral shell session tests (files a-r)"
+          - name: shell-ephemeral-b
+            path: tests/shell/ephemeral/[s-z]*.py
+            description: "Ephemeral shell session tests (files s-z)"
           - name: shell-persistent
             path: tests/shell/persistent
             description: "Persistent shell session tests"
@@ -185,15 +188,21 @@ jobs:
           - name: misc-cli
             path: tests/cli
             description: "CLI flag/format/output tests"
+          - name: misc-meta
+            path: tests/meta
+            description: "Meta tests (installation smoke, incus init detection)"
           - name: misc-snapshot
-            path: tests/meta tests/snapshot tests/image
-            description: "Snapshot, image, and meta command tests"
+            path: tests/snapshot tests/image
+            description: "Snapshot and image command tests"
           - name: misc-commands
             path: tests/audit tests/clean tests/completion tests/docker tests/errors tests/help tests/info tests/mount tests/monitor tests/top tests/shutdown tests/update tests/version tests/main_help_flag.py tests/main_help_shorthand.py
             description: "Misc commands: audit/clean/completion/docker/errors/help/info/mount/monitor/top/shutdown/update/version + root help files"
           - name: misc-config
-            path: tests/config tests/health tests/limits tests/schema
-            description: "Config, health, limits, and schema tests"
+            path: tests/config tests/limits tests/schema
+            description: "Config, limits, and schema tests"
+          - name: misc-health
+            path: tests/health
+            description: "Health command tests"
           - name: monitoring-nft
             path: tests/integration/test_nft_monitoring.py
             description: "NFT network monitoring tests"
@@ -206,9 +215,6 @@ jobs:
           - name: monitoring-advanced
             path: tests/security_monitoring/advanced
             description: "Host-side monitoring: env scan, process walk, fork bomb, spawn rate, auth log, proc events, cgroup init PID"
-          - name: monitoring-network-detection
-            path: tests/integration/test_network_connection_detection.py
-            description: "Host-side /proc/<pid>/net TCP/UDP suspicious connection detection"
           - name: monitoring-log-inotify
             path: tests/integration/test_log_watcher_inotify.py
             description: "inotify-driven auth.log/syslog monitoring: syslog coverage, prompt delivery, log rotation"
@@ -221,12 +227,9 @@ jobs:
           - name: git-hooks
             path: tests/git_hooks
             description: "Git hooks and security protection tests"
-          - name: monitoring-db
-            path: tests/integration/test_issue_505_resume_monitoring_panic.py tests/integration/test_gtfobins_db_pattern_detection.py tests/integration/test_gtfobins_db_absent_fallback.py tests/integration/test_sigma_db_detection.py
-            description: "Monitoring detection-DB load paths (GTFOBins + Sigma), present and absent, incl. #505 regression"
-          - name: terminal-pollution
-            path: tests/integration/test_session_diagnostics_no_terminal_pollution.py
-            description: "Session-runtime diagnostics must not leak onto the attached terminal (#372): nft debug + runtime-limit auto-stop"
+          - name: monitoring-small
+            path: tests/integration/test_network_connection_detection.py tests/integration/test_issue_505_resume_monitoring_panic.py tests/integration/test_gtfobins_db_pattern_detection.py tests/integration/test_gtfobins_db_absent_fallback.py tests/integration/test_sigma_db_detection.py tests/integration/test_session_diagnostics_no_terminal_pollution.py
+            description: "Small lanes merged: network-connection detection, detection-DB load paths (#505), no terminal pollution (#372)"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 

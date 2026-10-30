@@ -100,7 +100,11 @@ def main() -> int:
     for group in ci["jobs"]["integration"]["strategy"]["matrix"]["test_group"]:
         path_field = group.get("path", "")
         for token in path_field.split():
-            covered.add(token)
+            if any(c in token for c in "*?["):
+                # Shell glob (the lane's pytest command line is expanded by bash).
+                covered.update(str(p.relative_to(repo)) for p in repo.glob(token))
+            else:
+                covered.add(token)
 
     uncovered: list[str] = []
 
